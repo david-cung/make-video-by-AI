@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "project": {
+    "title": "A858",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30
+  },
+  "shots": [
+    {
+      "id": "001",
+      "start": 0.0,
+      "end": 5.8,
+      "asset_slot": "opening_computer",
+      "asset_type": "image",
+      "motion": {
+        "type": "slow_push_in",
+        "start_scale": 1.0,
+        "end_scale": 1.08
+      },
+      "transition_in": {"type": "cut", "duration": 0},
+      "transition_out": {"type": "cut", "duration": 0},
+      "overlay": {
+        "type": "text",
+        "text": "A858",
+        "position": "center",
+        "style": "hero",
+        "start_offset": 0.2,
+        "end_offset": 2.0
+      }
+    },
+    {
+      "id": "002",
+      "start": 5.8,
+      "end": 12.0,
+      "asset_slot": "empty_posts",
+      "asset_type": "video",
+      "source_start": 0.0,
+      "short_video_behavior": "freeze_last_frame",
+      "motion": {"type": "static"},
+      "transition_in": {"type": "cross_dissolve", "duration": 0.4},
+      "transition_out": {"type": "cut", "duration": 0}
+    }
+  ]
+}
+
