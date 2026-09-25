@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,33 @@ from .models import (
 
 
 STATE_FILE = "project_state.json"
+REQUIRED_DIRECTORIES = (
+    "assets", "audio", "audio/music", "audio/sfx", "output", "cache", "cache/shots", "logs"
+)
+logger = logging.getLogger(__name__)
+
+
+def _filesystem_error(operation: str, path: Path, exc: OSError) -> ProjectError:
+    logger.error("Filesystem operation failed: %s at %s: %s", operation, path, exc, exc_info=exc)
+    return ProjectError(f"Could not {operation} at {path}: {exc}")
+
+
+def _ensure_directory(path: Path) -> None:
+    operation = "create directory"
+    try:
+        if path.exists() or path.is_symlink():
+            if not path.is_dir():
+                kind = "a file" if path.is_file() else "a non-directory path"
+                raise ProjectError(f"Cannot {operation} at {path}: existing path is {kind}.")
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _filesystem_error(operation, path, exc) from exc
+
+
+def _ensure_project_directories(root: Path) -> None:
+    _ensure_directory(root)
+    for name in REQUIRED_DIRECTORIES:
+        _ensure_directory(root / name)
 
 
 @dataclass
@@ -24,9 +52,7 @@ class EditorProject:
     @classmethod
     def create(cls, root: Path) -> "EditorProject":
         root = root.expanduser().resolve()
-        root.mkdir(parents=True, exist_ok=True)
-        for name in ("assets", "audio/music", "audio/sfx", "output", "cache", "logs"):
-            (root / name).mkdir(parents=True, exist_ok=True)
+        _ensure_project_directories(root)
         state_path = root / STATE_FILE
         if state_path.exists():
             return cls.open(root)
@@ -46,8 +72,7 @@ class EditorProject:
             raise ProjectError(f"Could not open project: {exc}") from exc
         if not isinstance(state, dict):
             raise ProjectError(f"Invalid {STATE_FILE}: root must be an object.")
-        for name in ("assets", "audio/music", "audio/sfx", "output", "cache", "logs"):
-            (root / name).mkdir(parents=True, exist_ok=True)
+        _ensure_project_directories(root)
         state.setdefault("inputs", {})
         state.setdefault("assets", {})
         return cls(root, state)
@@ -57,9 +82,12 @@ class EditorProject:
         temporary = target.with_suffix(".tmp")
         try:
             temporary.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise _filesystem_error("write project state", temporary, exc) from exc
+        try:
             temporary.replace(target)
         except OSError as exc:
-            raise ProjectError(f"Could not save project state: {exc}") from exc
+            raise _filesystem_error("replace project state", target, exc) from exc
 
     def resolve(self, value: str | Path) -> Path:
         path = Path(value)
@@ -134,4 +162,3 @@ class EditorProject:
                 ambiguous[slot] = [path.name for path in matches]
         self.save()
         return assigned, ambiguous
-
