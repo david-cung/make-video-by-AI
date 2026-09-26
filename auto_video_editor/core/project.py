@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +124,33 @@ class EditorProject:
     def asset_path(self, slot: str) -> Path | None:
         value = self.state.get("assets", {}).get(slot)
         return self.resolve(value) if value else None
+
+    def clear_asset(self, slot: str) -> bool:
+        """Remove an assignment without deleting the underlying media file."""
+        if slot not in self.state.get("assets", {}):
+            return False
+        del self.state["assets"][slot]
+        self.save()
+        return True
+
+    def invalidate_shot_cache(self, shot_ids: list[str]) -> int:
+        """Delete only cached renders belonging to the supplied shot IDs."""
+        removed = 0
+        cache_root = self.root / "cache"
+        shots_root = cache_root / "shots"
+        for shot_id in set(shot_ids):
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", shot_id).strip("._") or "shot"
+            candidates = list(shots_root.glob(f"shot_{safe_id}_*.mp4"))
+            candidates.append(cache_root / f"preview_shot_{safe_id}.mp4")
+            for candidate in candidates:
+                if not candidate.is_file():
+                    continue
+                try:
+                    candidate.unlink()
+                    removed += 1
+                except OSError as exc:
+                    raise _filesystem_error("invalidate shot cache", candidate, exc) from exc
+        return removed
 
     def assign_asset(self, slot: str, source: Path, copy_into_project: bool = True) -> Path:
         if not slot or "/" in slot or "\\" in slot:

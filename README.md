@@ -34,9 +34,9 @@ The app opens in a local browser. It does not upload project media.
 
 1. Enter a project folder and select **New Project** (or open a folder containing `project_state.json`).
 2. Import the finished narration, `timeline.json`, and `storyboard.json`.
-3. Put visual files in `assets/`, then select **Auto Match Assets**, or manually assign each slot.
-4. Validate. Fix every error before rendering.
-5. Use **Preview Shot** to inspect one motion treatment.
+3. Put visual files in `assets/` and select **Auto Match Assets**, or upload/replace an asset directly in its shot row.
+4. Each row immediately shows its thumbnail/video badge and `READY`, `MISSING`, or `ERROR` status. Use **Clear** to remove an assignment without deleting its media file.
+5. Select **Preview** in any ready row to inspect that shot.
 6. Use **Build Preview** for a fast, lower-resolution timeline review.
 7. Use **Render Final** for the project resolution and final encode.
 
@@ -58,6 +58,8 @@ project/
 ```
 
 Assignments are stored as relative paths in `project_state.json` when the file is inside the project. Selecting an asset never modifies `storyboard.json`.
+
+The shot list is scrollable and paginated (25–200 rows per page), with filters for missing, ready, and error rows. If several shots reuse one `asset_slot`, assigning, replacing, or clearing it in any row updates every corresponding row. Replacing or clearing a slot invalidates only cached renders for shots that reference that slot.
 
 ## `timeline.json`
 

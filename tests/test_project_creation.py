@@ -63,7 +63,10 @@ class ProjectCreationTest(unittest.TestCase):
                     _ensure_directory(path)
 
         self.assertIn(f"create directory at {path}", str(raised.exception))
-        self.assertIn("[WinError 5]", str(raised.exception))
+        self.assertTrue(
+            "[WinError 5]" in str(raised.exception) or "[Errno 13]" in str(raised.exception),
+            str(raised.exception),
+        )
         self.assertIn(f"create directory at {path}", logs.output[0])
 
 
