@@ -13,6 +13,7 @@ from auto_video_editor.core.project import EditorProject
 from auto_video_editor.core.renderer import RenderEngine
 from auto_video_editor.core.storyboard import load_storyboard
 from auto_video_editor.core.validator import validate_project
+from auto_video_editor.ui.app import preview_shot
 
 
 def ffmpeg(*arguments: str) -> None:
@@ -144,6 +145,14 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(assigned, [])
         self.assertEqual(set(ambiguous["slot"]), {"slot.jpg", "slot.png"})
         self.assertIsNone(project.asset_path("slot"))
+
+    def test_row_preview_returns_playable_video(self) -> None:
+        video_path, message = preview_shot(str(self.root), "001")
+        self.assertIsNotNone(video_path, message)
+        self.assertIn("Shot preview ready", message)
+        info = probe_media(Path(video_path))
+        self.assertEqual((info.width, info.height), (640, 360))
+        self.assertLessEqual(abs(info.duration - 1.2), 0.06)
 
 
 if __name__ == "__main__":

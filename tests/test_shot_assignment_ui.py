@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import gradio as gr
+from gradio.blocks import SessionState
+from gradio.utils import get_upload_folder
 from PIL import Image
 
 from auto_video_editor.core.project import EditorProject
 from auto_video_editor.ui.app import (
     _shot_rows,
     _summary,
+    _thumbnail_for_asset,
+    _video_for_ui,
     assign_row_asset,
     auto_match,
     build_app,
@@ -145,6 +152,99 @@ class ShotAssignmentUiTest(unittest.TestCase):
         try:
             self.assertEqual(type(app).__name__, "Blocks")
             self.assertGreaterEqual(len(app.config.get("dependencies", [])), 8)
+        finally:
+            app.close()
+
+    def test_thumbnail_is_cached_by_gradio_without_serving_the_original_file(self) -> None:
+        image_path = self.root / "assets" / "opening_computer.png"
+        make_image(image_path, (20, 40, 60))
+        thumbnail = _thumbnail_for_asset(image_path)
+        self.assertLessEqual(thumbnail.width, 145)
+        self.assertLessEqual(thumbnail.height, 82)
+        with gr.Blocks() as app:
+            app.has_launched = True  # Exercise Gradio's runtime file-path check.
+            component = gr.Image(value=thumbnail, interactive=False)
+        try:
+            cached_image = Path(component.value["path"])
+            self.assertTrue(cached_image.is_file())
+            self.assertNotEqual(cached_image.resolve(), image_path.resolve())
+        finally:
+            app.close()
+
+    def test_video_from_external_project_is_copied_into_gradio_allowed_temp(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as external_project:
+            video_path = Path(external_project) / "preview.mp4"
+            video_path.write_bytes(b"example video output")
+            with patch.object(Path, "cwd", return_value=Path("/outside-project")):
+                ui_path = Path(_video_for_ui(video_path))
+            self.assertNotEqual(ui_path, video_path)
+            self.assertTrue(ui_path.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()))
+            self.assertEqual(ui_path.read_bytes(), video_path.read_bytes())
+
+    def test_gradio_row_upload_updates_visible_status_and_shot_list(self) -> None:
+        app = build_app()
+        state = SessionState(app)
+
+        async def exercise() -> None:
+            initial = await app.process_api(
+                0, [str(self.root), 0, "All", 1, 50], state=state, session_hash="upload-test"
+            )
+            initial_thumb = next(
+                component for component in initial["render_config"]["components"]
+                if component["props"].get("key") == "thumb-001-shared_visual"
+            )
+            self.assertEqual(initial_thumb["type"], "image")
+            self.assertIsNone(initial_thumb["props"]["value"])
+            upload_event = next(
+                fn for fn in state.blocks_config.fns.values()
+                if fn.rendered_in is not None and fn.fn.__name__ == "upload_for_row"
+            )
+            upload_folder = Path(get_upload_folder())
+            upload_folder.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=upload_folder) as temporary:
+                image_path = Path(temporary) / "chosen.png"
+                make_image(image_path, (10, 30, 50))
+                file_data = {
+                    "path": str(image_path), "orig_name": image_path.name,
+                    "size": image_path.stat().st_size, "meta": {"_type": "gradio.FileData"},
+                }
+                uploaded = await app.process_api(
+                    upload_event, [str(self.root), file_data, 0],
+                    state=state, session_hash="upload-test",
+                )
+            visible_status, token, message = uploaded["data"]
+            self.assertIn("Ready: 2", visible_status)
+            self.assertIsNone(token)  # Gradio keeps gr.State values on the server.
+            state_ids = uploaded["changed_state_ids"]
+            self.assertEqual(len(state_ids), 1)
+            self.assertIn((state_ids[0], "change"), app.config["dependencies"][0]["targets"])
+            self.assertIn("Assigned", message)
+            refreshed = await app.process_api(
+                0, [str(self.root), state[state_ids[0]], "All", 1, 50],
+                state=state, session_hash="upload-test"
+            )
+            self.assertTrue(
+                any("Ready: 2" in str(component) for component in refreshed["render_config"]["components"])
+            )
+            refreshed_thumb = next(
+                component for component in refreshed["render_config"]["components"]
+                if component["props"].get("key") == "thumb-001-shared_visual"
+            )
+            self.assertEqual(refreshed_thumb["type"], "image")
+            self.assertIsInstance(refreshed_thumb["props"]["value"], dict)
+            self.assertTrue(all(
+                isinstance(component["props"]["value"], str)
+                for component in refreshed["render_config"]["components"]
+                if component["type"] == "markdown"
+            ))
+            preview_buttons = [
+                component for component in refreshed["render_config"]["components"]
+                if component["type"] == "button" and component["props"].get("value") == "Preview"
+            ]
+            self.assertEqual(sum(bool(button["props"].get("interactive")) for button in preview_buttons), 2)
+
+        try:
+            asyncio.run(exercise())
         finally:
             app.close()
 

@@ -136,6 +136,7 @@ python3 -m unittest discover -s tests -v
 - **FFmpeg/ffprobe missing:** install FFmpeg and restart the terminal so both commands are on `PATH`.
 - **Invalid JSON:** validate JSON syntax and required storyboard fields; the UI reports the field or shot.
 - **Missing asset:** assign the reported `asset_slot`, or add one uniquely named supported file to `assets/` and auto-match again.
+- **Project folder outside the app directory:** the UI builds small thumbnails in memory and places video previews in a temporary directory that Gradio can serve. Your original media stays in the project folder.
 - **Timeline mismatch:** ensure the top-level timeline duration came from the same finished narration file.
 - **Render failure:** read `logs/latest_render.log`; the UI shows a concise error plus the last relevant log lines.
 - **Corrupt/unsupported media:** transcode it to a supported still format or H.264 MP4 and reassign it.

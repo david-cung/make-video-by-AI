@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+
+from PIL import Image
 
 from auto_video_editor.core.media import probe_media
 from auto_video_editor.core.models import (
@@ -32,6 +39,7 @@ class ShotRowView:
 # path, size, or nanosecond modification time changes.
 _asset_health_cache: dict[tuple[str, int, int, str], tuple[str, str]] = {}
 _row_errors: dict[tuple[str, str], str] = {}
+_video_preview_directory: tempfile.TemporaryDirectory[str] | None = None
 
 APP_CSS = """
 #shot-list { max-height: 68vh; overflow-y: auto; border: 1px solid var(--border-color-primary); border-radius: 10px; padding: 4px; }
@@ -93,6 +101,42 @@ def _asset_health(path: Path, asset_type: str) -> tuple[str, str]:
         result = ("ERROR", "Corrupt or unreadable media")
     _asset_health_cache[key] = result
     return result
+
+
+@lru_cache(maxsize=256)
+def _thumbnail(path: Path, size: int, modified_ns: int) -> Image.Image:
+    """Give Gradio pixels created by this app, not a path to external media."""
+    with Image.open(path) as source:
+        source.thumbnail((145, 82), Image.Resampling.LANCZOS)
+        return source.convert("RGB")
+
+
+def _thumbnail_for_asset(path: Path) -> Image.Image:
+    stat = path.stat()
+    return _thumbnail(path, stat.st_size, stat.st_mtime_ns)
+
+
+def _video_for_ui(path: Path) -> str:
+    """Expose rendered video from external project folders through Gradio's temp dir."""
+    source = path.resolve()
+    if source.is_relative_to(Path.cwd().resolve()) or source.is_relative_to(Path(tempfile.gettempdir()).resolve()):
+        return str(source)
+    global _video_preview_directory
+    if _video_preview_directory is None:
+        _video_preview_directory = tempfile.TemporaryDirectory(prefix="auto_documentary_ui_")
+    stat = source.stat()
+    signature = f"{source}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+    destination = Path(_video_preview_directory.name) / f"{hashlib.sha256(signature).hexdigest()[:24]}{source.suffix}"
+    if not destination.is_file():
+        fd, temporary_name = tempfile.mkstemp(dir=_video_preview_directory.name, suffix=source.suffix)
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return str(destination)
 
 
 def _shot_rows(project: EditorProject) -> list[ShotRowView]:
@@ -158,6 +202,13 @@ def _project_status(project: EditorProject) -> str:
         f"Narration: {'✓' if narration and narration.is_file() else 'MISSING'} · "
         f"Timeline: {'✓' if timeline and timeline.is_file() else 'MISSING'} · Storyboard: ✓"
     )
+
+
+def _status_after_row_action(path: str) -> str:
+    try:
+        return _project_status(_load(path))
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
 def _next_token(token: float | int | None) -> int:
@@ -319,7 +370,7 @@ def render(path: str, preview: bool, progress):
             progress(None, desc=message)
 
         target = RenderEngine(project, progress=update).render(preview=preview)
-        return str(target), "\n".join(messages)
+        return _video_for_ui(target), "\n".join(messages)
     except Exception as exc:
         return None, f"Render error:\n{exc}"
 
@@ -327,7 +378,7 @@ def render(path: str, preview: bool, progress):
 def preview_shot(path: str, shot_id: str):
     try:
         target = RenderEngine(_load(path)).preview_shot(shot_id)
-        return str(target), f"Shot preview ready: {target.name}"
+        return _video_for_ui(target), f"Shot preview ready: {target.name}"
     except Exception as exc:
         return None, f"Preview error: {exc}"
 
@@ -344,7 +395,7 @@ def build_app():
 
     with gr.Blocks(title="Auto Documentary Video Editor") as app:
         gr.Markdown("# AUTO DOCUMENTARY VIDEO EDITOR\nReliable, storyboard-driven documentary assembly. Narration is the master timeline.")
-        refresh_token = gr.Number(value=0, visible=False)
+        refresh_token = gr.State(value=0)
         project_path = gr.Textbox(label="Project folder", placeholder="/path/to/my-documentary")
         with gr.Row():
             new_button = gr.Button("New Project", variant="primary")
@@ -407,15 +458,25 @@ def build_app():
                             f"**{row.shot_id}**  \n{row.start:.2f} → {row.end:.2f}  \n`{row.asset_slot}`",
                             scale=2, min_width=150, elem_classes="shot-meta",
                         )
-                        if row.asset_path and row.status != "MISSING" and row.asset_type == "image" and row.asset_path.is_file():
+                        if row.asset_type == "image":
+                            preview_image = None
+                            if row.asset_path and row.status == "READY":
+                                try:
+                                    preview_image = _thumbnail_for_asset(row.asset_path)
+                                except (OSError, ValueError):
+                                    pass
+                            # Keep the component type and key stable across uploads. Swapping
+                            # Markdown for Image can give a recycled Markdown an image object.
                             gr.Image(
-                                value=str(row.asset_path), type="filepath", interactive=False,
+                                value=preview_image, type="pil", interactive=False,
                                 show_label=False, container=False, height=82, width=145,
                                 buttons=[], elem_classes="shot-thumb", key=f"thumb-{row_key}",
+                                preserved_by_key=[],
                             )
-                        elif row.asset_path and row.asset_type == "video":
+                        elif row.asset_type == "video":
                             gr.Markdown(
-                                f"🎬 **VIDEO**  \n{row.asset_path.name}", scale=2, min_width=145,
+                                f"🎬 **VIDEO**  \n{row.asset_path.name}" if row.asset_path else "_No asset_",
+                                scale=2, min_width=145,
                                 elem_classes="shot-file",
                             )
                         else:
@@ -449,25 +510,34 @@ def build_app():
                                 )
 
                         def upload_for_row(project_value, upload_value, token_value, slot=row.asset_slot):
-                            return assign_row_asset(project_value, slot, upload_value, token_value)
+                            next_token, message = assign_row_asset(project_value, slot, upload_value, token_value)
+                            if message.startswith("Assignment error:"):
+                                gr.Warning(message, duration=8)
+                            return _status_after_row_action(project_value), next_token, message
 
                         def clear_for_row(project_value, token_value, slot=row.asset_slot):
-                            return clear_row_asset(project_value, slot, token_value)
+                            next_token, message = clear_row_asset(project_value, slot, token_value)
+                            if message.startswith("Clear error:"):
+                                gr.Warning(message, duration=8)
+                            return _status_after_row_action(project_value), next_token, message
 
                         def preview_for_row(project_value, shot=row.shot_id):
-                            return preview_shot(project_value, shot)
+                            video_path, message = preview_shot(project_value, shot)
+                            if video_path is None:
+                                gr.Warning(message, duration=8)
+                            return video_path, message
 
                         upload.upload(
                             upload_for_row, [project_path, upload, refresh_token],
-                            [refresh_token, row_message], key=f"upload-event-{row_key}",
+                            [status, refresh_token, row_message], key=f"upload-event-{row_key}",
                         )
                         clear_button.click(
                             clear_for_row, [project_path, refresh_token],
-                            [refresh_token, row_message], key=f"clear-event-{row_key}",
+                            [status, refresh_token, row_message], key=f"clear-event-{row_key}",
                         )
                         preview_button.click(
                             preview_for_row, [project_path], [video, validation],
-                            key=f"preview-event-{row_key}",
+                            key=f"preview-event-{row_key}", scroll_to_output=True,
                         )
 
         gr.Markdown("## Validate and render")
@@ -488,10 +558,10 @@ def build_app():
         validate_button.click(validate, [project_path], [validation])
         preview_button.click(
             lambda path, progress=gr.Progress(): render(path, True, progress),
-            [project_path], [video, validation],
+            [project_path], [video, validation], scroll_to_output=True,
         )
         final_button.click(
             lambda path, progress=gr.Progress(): render(path, False, progress),
-            [project_path], [video, validation],
+            [project_path], [video, validation], scroll_to_output=True,
         )
     return app
