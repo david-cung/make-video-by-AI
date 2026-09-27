@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 import json
 import os
 import shutil
@@ -7,13 +8,15 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 
 from auto_video_editor.core.media import probe_media, require_ffmpeg
+from auto_video_editor.core.models import StoryboardScope, Transition
 from auto_video_editor.core.project import EditorProject
 from auto_video_editor.core.renderer import RenderEngine
 from auto_video_editor.core.storyboard import load_storyboard
-from auto_video_editor.core.validator import validate_project
-from auto_video_editor.ui.app import preview_shot
+from auto_video_editor.core.validator import format_report, validate_project
+from auto_video_editor.ui.app import preview_shot, render_ready_prefix
 
 
 def ffmpeg(*arguments: str) -> None:
@@ -153,6 +156,106 @@ class IntegrationTest(unittest.TestCase):
         info = probe_media(Path(video_path))
         self.assertEqual((info.width, info.height), (640, 360))
         self.assertLessEqual(abs(info.duration - 1.2), 0.06)
+
+    def test_range_preview_ignores_missing_assets_and_trims_audio(self) -> None:
+        segmented_voice = self.root / "segmented_voice.wav"
+        ffmpeg(
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=1.2",
+            "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=2.8",
+            "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[out]",
+            "-map", "[out]", "-c:a", "pcm_s16le", str(segmented_voice),
+        )
+        self.project.set_input("narration", segmented_voice)
+        self.project.clear_asset("opening")
+        self.project.state["inputs"].pop("timeline")
+        self.project.save()
+        storyboard = load_storyboard(self.project.input_path("storyboard"))
+        report = validate_project(self.project, storyboard, shot_range=("002", "003"))
+        self.assertTrue(report.ok, format_report(report))
+        self.assertFalse(any("opening" in issue.message for issue in report.issues))
+        self.assertFalse(validate_project(self.project, storyboard, shot_range=("001", "003")).ok)
+        self.assertFalse(validate_project(self.project, storyboard, shot_range=("003", "002")).ok)
+        output = RenderEngine(self.project).render_range("002", "003")
+        info = probe_media(output)
+        self.assertTrue(info.has_audio)
+        self.assertLessEqual(abs(info.duration - (4.0 - 1.2)), 0.06)
+        self.assertEqual((info.width, info.height), (640, 360))
+        self.assertEqual(output.name, "preview_002_003.mp4")
+        beginning = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-i", str(output), "-vn", "-t", "0.2",
+                "-ac", "1", "-ar", "48000", "-f", "s16le", "-",
+            ],
+            check=True, capture_output=True,
+        ).stdout
+        samples = array("h")
+        samples.frombytes(beginning)
+        self.assertGreater(sum(abs(value) for value in samples) / len(samples), 100)
+
+    def test_ready_prefix_stops_before_first_missing_asset(self) -> None:
+        self.project.clear_asset("ending")
+        output, message = render_ready_prefix(str(self.root), lambda *_args, **_kwargs: None)
+        self.assertIsNotNone(output, message)
+        self.assertIn("Range 001 → 002", message)
+        self.assertLessEqual(abs(probe_media(Path(output)).duration - 2.7), 0.06)
+
+    def test_partial_storyboard_and_boundary_transition_rules(self) -> None:
+        storyboard = load_storyboard(self.project.input_path("storyboard"))
+        first, second, third = storyboard.shots
+        same_boundary = replace(
+            storyboard,
+            shots=(
+                replace(first, transition_out=Transition("fade", 0.2)),
+                replace(second, transition_in=Transition("fade", 0.2)),
+                third,
+            ),
+        )
+        self.assertTrue(validate_project(self.project, same_boundary).ok)
+        self.assertFalse(any("Conflicting transitions" in issue.message for issue in
+                             validate_project(self.project, same_boundary).issues))
+        conflicting = replace(
+            storyboard,
+            shots=(
+                replace(first, transition_out=Transition("fade", 0.2)),
+                replace(second, transition_in=Transition("cross_dissolve", 0.3)),
+                third,
+            ),
+        )
+        report = validate_project(self.project, conflicting)
+        self.assertTrue(report.ok, format_report(report))
+        self.assertIn("Using transition_out once", format_report(report))
+        self.assertEqual(
+            RenderEngine._boundary_transition(conflicting.shots[0], conflicting.shots[1]),
+            Transition("fade", 0.2),
+        )
+        partial = replace(storyboard, shots=(first, second))
+        report = validate_project(self.project, partial)
+        self.assertTrue(report.ok, format_report(report))
+        self.assertIn(
+            "INFO: Storyboard currently covers narration 00:00.00 → 00:02.70. "
+            "Full narration duration: 00:04.00.",
+            format_report(report),
+        )
+        full_scope = replace(partial, scope=StoryboardScope(type="full"))
+        self.assertFalse(validate_project(self.project, full_scope).ok)
+        output = RenderEngine(self.project).render_range("001", "002")
+        self.assertLessEqual(abs(probe_media(output).duration - 2.7), 0.06)
+
+    def test_full_preview_of_partial_storyboard_uses_only_covered_audio(self) -> None:
+        storyboard_path = self.project.input_path("storyboard")
+        data = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        data["shots"] = data["shots"][:2]
+        data["scope"] = {"type": "segment", "narration_start": 0.0, "narration_end": 2.7}
+        storyboard_path.write_text(json.dumps(data), encoding="utf-8")
+        storyboard = load_storyboard(storyboard_path)
+        self.assertEqual(storyboard.scope.narration_end, 2.7)
+        report = validate_project(self.project, storyboard)
+        self.assertTrue(report.ok, format_report(report))
+        self.assertIn("Full narration duration: 00:04.00", format_report(report))
+        output = RenderEngine(self.project).render(preview=True)
+        self.assertLessEqual(abs(probe_media(output).duration - 2.7), 0.06)
+        final = RenderEngine(self.project).render(preview=False)
+        self.assertLessEqual(abs(probe_media(final).duration - 2.7), 0.06)
 
 
 if __name__ == "__main__":

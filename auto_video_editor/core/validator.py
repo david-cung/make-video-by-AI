@@ -16,11 +16,26 @@ from .models import (
     ValidationReport,
 )
 from .project import EditorProject
-from .storyboard import load_timeline_duration
+from .storyboard import load_timeline_duration, select_shot_range
 
 
-def validate_project(project: EditorProject, storyboard: Storyboard, probe_assets: bool = True) -> ValidationReport:
+def _clock_time(seconds: float) -> str:
+    minutes, remainder = divmod(seconds, 60)
+    return f"{int(minutes):02d}:{remainder:05.2f}"
+
+
+def validate_project(
+    project: EditorProject,
+    storyboard: Storyboard,
+    probe_assets: bool = True,
+    shot_range: tuple[str, str] | None = None,
+) -> ValidationReport:
     report = ValidationReport()
+    try:
+        shots = select_shot_range(storyboard, *shot_range) if shot_range else storyboard.shots
+    except ProjectError as exc:
+        report.add_error(str(exc))
+        return report
     try:
         require_ffmpeg()
     except ProjectError as exc:
@@ -50,17 +65,17 @@ def validate_project(project: EditorProject, storyboard: Storyboard, probe_asset
         except ProjectError as exc:
             narration_duration = None
             report.add_error(str(exc))
-    if timeline is None or not timeline.is_file():
-        report.add_error("Timeline JSON is missing.")
-        timeline_duration = None
-    else:
-        try:
-            timeline_duration = load_timeline_duration(timeline)
-        except ProjectError as exc:
-            timeline_duration = None
-            report.add_error(str(exc))
+    timeline_duration = None
+    if not shot_range:
+        if timeline is None or not timeline.is_file():
+            report.add_error("Timeline JSON is missing.")
+        else:
+            try:
+                timeline_duration = load_timeline_duration(timeline)
+            except ProjectError as exc:
+                report.add_error(str(exc))
     tolerance = max(0.05, 1.0 / max(settings.fps, 1))
-    if narration_duration and timeline_duration and abs(narration_duration - timeline_duration) > tolerance:
+    if not shot_range and narration_duration and timeline_duration and abs(narration_duration - timeline_duration) > tolerance:
         report.add_error(
             f"Timeline duration ({timeline_duration:.3f}s) differs from narration "
             f"({narration_duration:.3f}s) by more than {tolerance:.3f}s."
@@ -68,7 +83,7 @@ def validate_project(project: EditorProject, storyboard: Storyboard, probe_asset
 
     seen_ids: set[str] = set()
     previous = None
-    for shot in storyboard.shots:
+    for shot in shots:
         if not shot.id.strip():
             report.add_error("Shot ID cannot be empty.")
         if not shot.asset_slot.strip():
@@ -93,8 +108,11 @@ def validate_project(project: EditorProject, storyboard: Storyboard, probe_asset
                 and shot.transition_in.type != "cut"
                 and previous.transition_out != shot.transition_in
             ):
-                report.add_error(
-                    "Conflicting non-cut transitions are declared on both sides of this boundary.", shot.id
+                report.add_warning(
+                    f"Conflicting transitions at boundary {previous.id} → {shot.id}: "
+                    f"transition_out={previous.transition_out.type} ({previous.transition_out.duration:g}s), "
+                    f"transition_in={shot.transition_in.type} ({shot.transition_in.duration:g}s). "
+                    "Using transition_out once.", shot.id
                 )
         previous = shot
         if shot.asset_type not in SUPPORTED_ASSET_TYPES:
@@ -155,25 +173,45 @@ def validate_project(project: EditorProject, storyboard: Storyboard, probe_asset
             except ProjectError as exc:
                 report.add_error(str(exc), shot.id)
 
-    if storyboard.shots:
-        first = storyboard.shots[0]
-        if round(first.start * settings.fps) != 0:
-            report.add_error(f"Timeline starts with a {first.start:.3f}s gap.", first.id)
-        end = storyboard.shots[-1].end
+    if shots:
+        first = shots[0]
+        end = shots[-1].end
         master_duration = narration_duration or timeline_duration
         if master_duration:
             if round(end * settings.fps) > round(master_duration * settings.fps):
                 report.add_error(
                     f"Storyboard ends at {end:.3f}s, beyond narration duration {master_duration:.3f}s."
                 )
-            elif round(end * settings.fps) < round(master_duration * settings.fps):
-                report.add_error(
-                    f"Storyboard ends {master_duration - end:.3f}s before the narration."
+            elif not shot_range and round(end * settings.fps) < round(master_duration * settings.fps):
+                message = (
+                    "Storyboard currently covers narration "
+                    f"{_clock_time(first.start)} → {_clock_time(end)}. "
+                    f"Full narration duration: {_clock_time(master_duration)}."
                 )
-        if first.transition_in.type != "cut":
+                if storyboard.scope.type == "full":
+                    report.add_error(message + " Full scope requires coverage of the entire narration.")
+                else:
+                    report.add_info(message)
+        if first.start < 0:
+            report.add_error("Storyboard starts before narration.", first.id)
+        if not shot_range:
+            scope = storyboard.scope
+            if scope.type not in {"segment", "full"}:
+                report.add_error(f'Unsupported storyboard scope type "{scope.type}".')
+            if scope.type == "full" and round(first.start * settings.fps) != 0:
+                report.add_error("Full-scope storyboard must start at narration time 0.", first.id)
+            for name, declared, actual in (
+                ("narration_start", scope.narration_start, first.start),
+                ("narration_end", scope.narration_end, end),
+            ):
+                if declared is not None and abs(declared - actual) > tolerance:
+                    report.add_error(
+                        f"scope.{name} ({declared:.3f}s) differs from storyboard boundary ({actual:.3f}s)."
+                    )
+        if not shot_range and first.transition_in.type != "cut":
             report.add_warning("The first shot's transition_in has no preceding shot and is ignored.", first.id)
-        last = storyboard.shots[-1]
-        if last.transition_out.type != "cut":
+        last = shots[-1]
+        if not shot_range and last.transition_out.type != "cut":
             report.add_warning("The last shot's transition_out has no following shot and is ignored.", last.id)
 
     if storyboard.music:
@@ -196,7 +234,7 @@ def validate_project(project: EditorProject, storyboard: Storyboard, probe_asset
 def format_report(report: ValidationReport) -> str:
     if not report.issues:
         return "Validation passed."
-    lines = ["Validation failed:" if report.errors else "Validation passed with warnings:"]
+    lines = ["Validation failed:" if report.errors else "Validation passed with notes:"]
     for issue in report.issues:
         lines.append(f"- {issue.severity.upper()}: {issue}")
     return "\n".join(lines)

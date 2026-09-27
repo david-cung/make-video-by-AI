@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -15,7 +15,7 @@ from .ffmpeg_builder import run_ffmpeg
 from .media import probe_media, require_ffmpeg
 from .models import ProjectError, Shot, Storyboard, Transition
 from .project import EditorProject
-from .storyboard import load_storyboard, load_timeline_duration
+from .storyboard import load_storyboard, select_shot_range
 from .validator import format_report, validate_project
 
 
@@ -228,9 +228,11 @@ class RenderEngine:
 
     @staticmethod
     def _boundary_transition(previous: Shot, current: Shot) -> Transition:
-        if current.transition_in.type != "cut":
-            return current.transition_in
-        return previous.transition_out
+        # A boundary has one transition. Older storyboards may declare it on
+        # either side; transition_out wins if both declarations differ.
+        if previous.transition_out.type != "cut":
+            return previous.transition_out
+        return current.transition_in
 
     def _assemble_visuals(
         self, storyboard: Storyboard, clips: list[Path], profile: RenderProfile, target: Path
@@ -282,8 +284,10 @@ class RenderEngine:
         run_ffmpeg(command, self.log_path, "building visual timeline")
 
     def _mux_audio(
-        self, storyboard: Storyboard, visual: Path, target: Path, duration: float, profile: RenderProfile
+        self, storyboard: Storyboard, visual: Path, target: Path,
+        audio_start: float, audio_end: float, profile: RenderProfile,
     ) -> None:
+        duration = audio_end - audio_start
         narration = self.project.input_path("narration")
         if narration is None:
             raise ProjectError("Narration audio is missing.")
@@ -291,7 +295,12 @@ class RenderEngine:
             "ffmpeg", "-hide_banner", "-y", "-loglevel", "warning",
             "-i", str(visual), "-i", str(narration),
         ]
-        audio_map = "1:a:0"
+        narration_filter = (
+            f"[1:a]atrim=start={audio_start:.9f}:end={audio_end:.9f},"
+            "asetpts=PTS-STARTPTS[narr]"
+        )
+        audio_filter = narration_filter
+        audio_map = "[narr]"
         if storyboard.music:
             file_value = storyboard.music.get("file")
             if not file_value:
@@ -302,15 +311,14 @@ class RenderEngine:
             volume_db = float(storyboard.music.get("volume_db", -24))
             fade_duration = min(2.0, duration / 4)
             command += ["-stream_loop", "-1", "-i", str(music_path)]
-            audio_filter = (
-                f"[1:a]atrim=0:{duration:.9f},asetpts=PTS-STARTPTS[narr];"
+            audio_filter = narration_filter + ";" + (
                 f"[2:a]atrim=0:{duration:.9f},asetpts=PTS-STARTPTS,volume={volume_db}dB,"
                 f"afade=t=in:st=0:d={fade_duration:.3f},"
                 f"afade=t=out:st={max(0.0, duration - fade_duration):.6f}:d={fade_duration:.3f}[music];"
                 f"[narr][music]amix=inputs=2:duration=first:normalize=0[aout]"
             )
-            command += ["-filter_complex", audio_filter]
             audio_map = "[aout]"
+        command += ["-filter_complex", audio_filter]
         command += [
             "-map", "0:v:0", "-map", audio_map,
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
@@ -320,45 +328,56 @@ class RenderEngine:
         ]
         run_ffmpeg(command, self.log_path, "muxing narration")
 
-    def render(self, preview: bool = False, force: bool = False) -> Path:
+    def render(
+        self, preview: bool = False, force: bool = False,
+        shot_range: tuple[str, str] | None = None,
+    ) -> Path:
+        if shot_range and not preview:
+            raise ProjectError("Shot ranges are available for preview only.")
         require_ffmpeg()
         self.log_path.write_text("Auto Documentary Video Editor render log\n", encoding="utf-8")
         storyboard = self.load_storyboard()
         self._say("Validating project...")
-        report = validate_project(self.project, storyboard)
+        report = validate_project(self.project, storyboard, shot_range=shot_range)
         if not report.ok:
             raise ProjectError(format_report(report))
+        for issue in report.warnings + report.infos:
+            self._say(f"{issue.severity.upper()}: {issue}")
+        shots = select_shot_range(storyboard, *shot_range) if shot_range else storyboard.shots
+        selected_storyboard = replace(storyboard, shots=shots)
         profile = self.profile(storyboard, preview)
-        self._say(f"{len(storyboard.shots)} shots ready. Rendering at {profile.width}x{profile.height}...")
+        self._say(f"{len(shots)} shots ready. Rendering at {profile.width}x{profile.height}...")
         clips: list[Path] = []
         cache_hits = 0
-        for index, shot in enumerate(storyboard.shots, start=1):
-            self._say(f"Rendering shot {index}/{len(storyboard.shots)} ({shot.id})...")
+        for index, shot in enumerate(shots, start=1):
+            self._say(f"Rendering shot {index}/{len(shots)} ({shot.id})...")
             clip, cache_hit = self.render_shot(shot, profile, force=force)
             clips.append(clip)
             cache_hits += int(cache_hit)
         self._say(f"Shot cache: {cache_hits} reused, {len(clips) - cache_hits} rendered.")
         output_dir = self.project.root / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
-        visual = self.project.root / "cache" / f"assembled_{profile.name}.mp4"
+        suffix = f"_{_safe_id(shots[0].id)}_{_safe_id(shots[-1].id)}" if shot_range else ""
+        visual = self.project.root / "cache" / f"assembled_{profile.name}{suffix}.mp4"
         self._say("Building timeline...")
-        self._assemble_visuals(storyboard, clips, profile, visual)
-        timeline = self.project.input_path("timeline")
-        if timeline is None:
-            raise ProjectError("Timeline JSON is missing.")
-        duration = load_timeline_duration(timeline)
-        target = output_dir / ("preview.mp4" if preview else "final.mp4")
+        self._assemble_visuals(selected_storyboard, clips, profile, visual)
+        audio_start, audio_end = shots[0].start, shots[-1].end
+        duration = audio_end - audio_start
+        target = output_dir / (f"preview{suffix}.mp4" if preview else "final.mp4")
         self._say("Muxing narration...")
-        self._mux_audio(storyboard, visual, target, duration, profile)
+        self._mux_audio(storyboard, visual, target, audio_start, audio_end, profile)
         result = probe_media(target)
         tolerance = max(0.05, 1 / profile.fps + 0.02)
         if abs(result.duration - duration) > tolerance:
             raise ProjectError(
-                f"Rendered duration {result.duration:.3f}s differs from narration timeline "
+                f"Rendered duration {result.duration:.3f}s differs from selected narration range "
                 f"{duration:.3f}s by more than {tolerance:.3f}s."
             )
         self._say(f"Complete: {target}")
         return target
+
+    def render_range(self, first_id: str, last_id: str) -> Path:
+        return self.render(preview=True, shot_range=(first_id, last_id))
 
     def preview_shot(self, shot_id: str) -> Path:
         storyboard = self.load_storyboard()

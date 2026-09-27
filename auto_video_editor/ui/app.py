@@ -18,7 +18,7 @@ from auto_video_editor.core.models import (
 )
 from auto_video_editor.core.project import EditorProject
 from auto_video_editor.core.renderer import RenderEngine
-from auto_video_editor.core.storyboard import load_storyboard, load_timeline_duration
+from auto_video_editor.core.storyboard import load_storyboard, load_timeline_duration, select_shot_range
 from auto_video_editor.core.validator import format_report, validate_project
 
 
@@ -375,6 +375,70 @@ def render(path: str, preview: bool, progress):
         return None, f"Render error:\n{exc}"
 
 
+def range_overview(path: str, first_id: str | None, last_id: str | None) -> str:
+    try:
+        project = _load(path)
+        storyboard = load_storyboard(project.input_path("storyboard"))
+        shots = select_shot_range(storyboard, first_id or "", last_id or "")
+        statuses = {row.shot_id: row.status for row in _shot_rows(project)}
+        ready = sum(statuses.get(shot.id) == "READY" for shot in shots)
+        return (
+            f"**Duration:** {shots[-1].end - shots[0].start:.2f}s "
+            f"({shots[0].start:.2f}s → {shots[-1].end:.2f}s narration) · "
+            f"**Ready:** {ready}/{len(shots)}"
+        )
+    except Exception as exc:
+        return f"Select a valid preview range. {exc}"
+
+
+def sync_range_controls(path: str, first_id: str | None, last_id: str | None):
+    import gradio as gr
+
+    try:
+        storyboard = load_storyboard(_load(path).input_path("storyboard"))
+        ids = [shot.id for shot in storyboard.shots]
+        if not ids:
+            raise ProjectError("Storyboard contains no shots.")
+        first = first_id if first_id in ids else ids[0]
+        last = last_id if last_id in ids and ids.index(last_id) >= ids.index(first) else ids[-1]
+        return (
+            gr.update(choices=ids, value=first),
+            gr.update(choices=ids, value=last),
+            range_overview(path, first, last),
+        )
+    except Exception:
+        return gr.update(choices=[], value=None), gr.update(choices=[], value=None), "Open a storyboard to choose a range."
+
+
+def render_range(path: str, first_id: str, last_id: str, progress):
+    try:
+        messages: list[str] = []
+
+        def update(message: str) -> None:
+            messages.append(message)
+            progress(None, desc=message)
+
+        target = RenderEngine(_load(path), progress=update).render_range(first_id, last_id)
+        return _video_for_ui(target), f"Range {first_id} → {last_id}\n" + "\n".join(messages)
+    except Exception as exc:
+        return None, f"Range preview error:\n{exc}"
+
+
+def render_ready_prefix(path: str, progress):
+    try:
+        rows = _shot_rows(_load(path))
+        ready = []
+        for row in rows:
+            if row.status != "READY":
+                break
+            ready.append(row)
+        if not ready:
+            raise ProjectError("No READY shot at the beginning of the storyboard.")
+        return render_range(path, ready[0].shot_id, ready[-1].shot_id, progress)
+    except Exception as exc:
+        return None, f"Ready prefix error:\n{exc}"
+
+
 def preview_shot(path: str, shot_id: str):
     try:
         target = RenderEngine(_load(path)).preview_shot(shot_id)
@@ -542,6 +606,14 @@ def build_app():
 
         gr.Markdown("## Validate and render")
         validate_button = gr.Button("Validate")
+        gr.Markdown("### Preview range")
+        with gr.Row():
+            range_from = gr.Dropdown(label="From Shot", choices=[])
+            range_to = gr.Dropdown(label="To Shot", choices=[])
+        range_status = gr.Markdown("Open a storyboard to choose a range.")
+        with gr.Row():
+            range_button = gr.Button("Build Range Preview", variant="primary")
+            prefix_button = gr.Button("Build Ready Prefix")
         with gr.Row():
             preview_button = gr.Button("Build Preview", variant="primary")
             final_button = gr.Button("Render Final")
@@ -556,6 +628,24 @@ def build_app():
             auto_match, [project_path, refresh_token], [project_path, status, refresh_token, row_message]
         )
         validate_button.click(validate, [project_path], [validation])
+        project_path.change(
+            sync_range_controls, [project_path, range_from, range_to],
+            [range_from, range_to, range_status],
+        )
+        refresh_token.change(
+            sync_range_controls, [project_path, range_from, range_to],
+            [range_from, range_to, range_status],
+        )
+        range_from.change(range_overview, [project_path, range_from, range_to], [range_status])
+        range_to.change(range_overview, [project_path, range_from, range_to], [range_status])
+        range_button.click(
+            lambda path, first, last, progress=gr.Progress(): render_range(path, first, last, progress),
+            [project_path, range_from, range_to], [video, validation], scroll_to_output=True,
+        )
+        prefix_button.click(
+            lambda path, progress=gr.Progress(): render_ready_prefix(path, progress),
+            [project_path], [video, validation], scroll_to_output=True,
+        )
         preview_button.click(
             lambda path, progress=gr.Progress(): render(path, True, progress),
             [project_path], [video, validation], scroll_to_output=True,

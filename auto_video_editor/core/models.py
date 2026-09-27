@@ -78,12 +78,20 @@ class Shot:
 
 
 @dataclass(frozen=True)
+class StoryboardScope:
+    type: str = "segment"
+    narration_start: float | None = None
+    narration_end: float | None = None
+
+
+@dataclass(frozen=True)
 class Storyboard:
     version: int
     project: ProjectSettings
     shots: tuple[Shot, ...]
     music: dict[str, Any] | None = None
     sfx: tuple[dict[str, Any], ...] = ()
+    scope: StoryboardScope = field(default_factory=StoryboardScope)
 
 
 @dataclass(frozen=True)
@@ -121,6 +129,10 @@ class ValidationReport:
         return [item for item in self.issues if item.severity == "warning"]
 
     @property
+    def infos(self) -> list[ValidationIssue]:
+        return [item for item in self.issues if item.severity == "info"]
+
+    @property
     def ok(self) -> bool:
         return not self.errors
 
@@ -130,3 +142,5 @@ class ValidationReport:
     def add_warning(self, message: str, shot_id: str | None = None) -> None:
         self.issues.append(ValidationIssue("warning", message, shot_id))
 
+    def add_info(self, message: str, shot_id: str | None = None) -> None:
+        self.issues.append(ValidationIssue("info", message, shot_id))

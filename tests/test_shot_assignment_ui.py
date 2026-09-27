@@ -22,6 +22,8 @@ from auto_video_editor.ui.app import (
     auto_match,
     build_app,
     clear_row_asset,
+    range_overview,
+    sync_range_controls,
 )
 
 
@@ -152,6 +154,47 @@ class ShotAssignmentUiTest(unittest.TestCase):
         try:
             self.assertEqual(type(app).__name__, "Blocks")
             self.assertGreaterEqual(len(app.config.get("dependencies", [])), 8)
+            labels = {
+                component["props"].get("value")
+                for component in app.config["components"]
+                if component["type"] == "button"
+            }
+            self.assertIn("Build Range Preview", labels)
+            self.assertIn("Build Ready Prefix", labels)
+        finally:
+            app.close()
+
+    def test_range_controls_show_duration_and_ready_count(self) -> None:
+        first, last, summary = sync_range_controls(str(self.root), None, None)
+        self.assertEqual(first["value"], "001")
+        self.assertEqual(last["value"], "015")
+        self.assertEqual(len(first["choices"]), 15)
+        self.assertIn("Duration:** 15.00s", summary)
+        image = self.root / "first.png"
+        make_image(image, (30, 50, 80))
+        assign_row_asset(str(self.root), "shared_visual", str(image))
+        summary = range_overview(str(self.root), "001", "003")
+        self.assertIn("Ready:** 1/3", summary)
+
+    def test_project_change_populates_range_dropdowns(self) -> None:
+        app = build_app()
+        state = SessionState(app)
+
+        async def exercise() -> None:
+            event = next(
+                fn for fn in app.fns.values()
+                if fn.fn is sync_range_controls
+            )
+            result = await app.process_api(
+                event, [str(self.root), None, None], state=state, session_hash="range-test"
+            )
+            first, last, summary = result["data"]
+            self.assertEqual(first["value"], "001")
+            self.assertEqual(last["value"], "015")
+            self.assertIn("Duration:** 15.00s", summary)
+
+        try:
+            asyncio.run(exercise())
         finally:
             app.close()
 

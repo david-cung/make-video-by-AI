@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import Motion, ProjectError, ProjectSettings, Shot, Storyboard, TextOverlay, Transition
+from .models import Motion, ProjectError, ProjectSettings, Shot, Storyboard, StoryboardScope, TextOverlay, Transition
 
 
 def _number(value: Any, name: str, default: float | None = None) -> float:
@@ -119,12 +119,27 @@ def load_storyboard(path: Path) -> Storyboard:
     sfx = data.get("sfx", [])
     if not isinstance(sfx, list):
         raise ProjectError('Field "sfx" must be an array.')
+    scope_data = data.get("scope") or {}
+    if not isinstance(scope_data, dict):
+        raise ProjectError('Field "scope" must be an object.')
+    scope = StoryboardScope(
+        type=str(scope_data.get("type", "segment")),
+        narration_start=(
+            _number(scope_data["narration_start"], "scope.narration_start")
+            if scope_data.get("narration_start") is not None else None
+        ),
+        narration_end=(
+            _number(scope_data["narration_end"], "scope.narration_end")
+            if scope_data.get("narration_end") is not None else None
+        ),
+    )
     return Storyboard(
         version=_integer(data.get("version"), "version", 1),
         project=project,
         shots=tuple(shots),
         music=music,
         sfx=tuple(sfx),
+        scope=scope,
     )
 
 
@@ -139,3 +154,13 @@ def load_timeline_duration(path: Path) -> float:
         raise ProjectError(f"Timeline not found: {path}") from exc
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise ProjectError(f"Invalid timeline JSON: {exc}") from exc
+
+
+def select_shot_range(storyboard: Storyboard, first_id: str, last_id: str) -> tuple[Shot, ...]:
+    ids = [shot.id for shot in storyboard.shots]
+    if ids.count(first_id) != 1 or ids.count(last_id) != 1:
+        raise ProjectError(f"Choose unique existing shot IDs for preview range: {first_id} → {last_id}.")
+    first_index, last_index = ids.index(first_id), ids.index(last_id)
+    if first_index > last_index:
+        raise ProjectError(f"Preview range must follow storyboard order: {first_id} → {last_id}.")
+    return storyboard.shots[first_index:last_index + 1]

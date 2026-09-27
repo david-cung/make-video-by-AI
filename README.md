@@ -37,8 +37,8 @@ The app opens in a local browser. It does not upload project media.
 3. Put visual files in `assets/` and select **Auto Match Assets**, or upload/replace an asset directly in its shot row.
 4. Each row immediately shows its thumbnail/video badge and `READY`, `MISSING`, or `ERROR` status. Use **Clear** to remove an assignment without deleting its media file.
 5. Select **Preview** in any ready row to inspect that shot.
-6. Use **Build Preview** for a fast, lower-resolution timeline review.
-7. Use **Render Final** for the project resolution and final encode.
+6. Select **From Shot** and **To Shot**, then use **Build Range Preview** to review only those shots. Missing assets outside the range do not block it. **Build Ready Prefix** automatically previews the longest ready sequence from the first shot.
+7. Use **Build Preview** for the entire storyboard (all its assets are required), or **Render Final** for the project resolution and final encode.
 
 The created layout is:
 
@@ -54,6 +54,7 @@ project/
   cache/shots/
   logs/latest_render.log
   output/preview.mp4
+  output/preview_001_008.mp4
   output/final.mp4
 ```
 
@@ -63,7 +64,7 @@ The shot list is scrollable and paginated (25–200 rows per page), with filters
 
 ## `timeline.json`
 
-The renderer reads its existing top-level positive `duration`; it never derives narration timing from text. The duration must agree with the probed narration duration within one frame (or 50 ms, whichever is larger).
+Full-project validation reads the existing top-level positive `duration`; it never derives narration timing from text. The duration must agree with the probed narration duration within one frame (or 50 ms, whichever is larger). Range preview needs only the narration WAV and selected storyboard shots.
 
 ## Storyboard schema
 
@@ -73,7 +74,8 @@ Top-level fields:
 
 - `version`: must be `1`.
 - `project`: `title`, even `width`/`height`, and integer `fps` (1–120).
-- `shots`: ordered, contiguous shot objects covering the narration timeline.
+- `shots`: ordered, contiguous shot objects covering the chosen narration segment.
+- `scope` (optional): `{"type": "segment", "narration_start": 0, "narration_end": 84.15}`. The default is `segment` with bounds inferred from the first and last shot. Use `{"type": "full"}` to require coverage of the complete narration.
 - `music` (optional): `{"file": "audio/music/ambient.mp3", "volume_db": -24}`.
 - `sfx` (reserved): accepted structurally for forward compatibility but not mixed in V1.
 
@@ -102,15 +104,17 @@ All visuals use cover scaling and center crop; nothing is stretched. Video sourc
 - `cross_dissolve`: a dissolve from the held outgoing frame into the incoming shot.
 - `dip_to_black`: FFmpeg's fade-through-black blend.
 
-A non-cut transition occupies the first `duration` seconds of the incoming shot. The preceding composed frame is extended only as the outgoing transition handle; the total timeline is not shortened. If `transition_in` is a cut, the preceding shot's `transition_out` controls the boundary.
+A non-cut transition occupies the first `duration` seconds of the incoming shot. The preceding composed frame is extended only as the outgoing transition handle; the total timeline is not shortened. Each boundary uses exactly one transition: `transition_out` takes precedence, otherwise `transition_in` is used. Identical declarations on both sides are applied once; differing non-cut declarations produce a validation warning and `transition_out` wins.
 
-Visual frame boundaries are calculated from absolute timestamps: `round(start × fps)` and `round(end × fps)`. Adjacent frame spans therefore telescope, avoiding cumulative duration rounding. The narration is never trimmed internally, stretched, normalized, or retimed. The muxed output is constrained to the declared narration duration, and ffprobe verifies the result.
+Visual frame boundaries are calculated from absolute timestamps: `round(start × fps)` and `round(end × fps)`. Adjacent frame spans therefore telescope, avoiding cumulative duration rounding. Preview and final output trim narration to the selected storyboard span, then rebase it to time zero without stretching or retiming. The muxed output is checked against the selected span within frame/timebase tolerance.
 
 ## Preview and final output
 
 Preview uses a maximum width of 960 pixels, preserves aspect ratio and project FPS, and encodes H.264 with `veryfast`/CRF 25. Final uses the project dimensions (default 1920×1080), project FPS (default 30), H.264 `medium`/CRF 18, and AAC at 192 kb/s. Both are YouTube-compatible `yuv420p` MP4 files.
 
-Optional music loops to narration duration, defaults to -24 dB, and receives short fades. It is mixed below the unchanged narration. Automatic music or SFX selection is not included.
+Range preview validates only its selected shots and assets, their internal transitions, and narration coverage. Full preview and final render require assets for every storyboard shot, but a segment storyboard may end before the full narration. `timeline.json` still describes the complete narration and must agree with its WAV duration for full-project validation.
+
+Optional music loops to the selected output duration, defaults to -24 dB, and receives short fades. It is mixed below the trimmed, otherwise unchanged narration. Automatic music or SFX selection is not included.
 
 ## Cache
 
